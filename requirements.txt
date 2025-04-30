@@ -1,0 +1,4 @@
+# Python >=3.12
+pcap-ct>=1.2.5          # захват пакетов (кроссплатформенно, замена pylibpcap)
+dpkt>=1.9.8             # парсинг pcap/ethernet/IP/TCP/UDP
+matplotlib>=3.5         # графики по протоколам

@@ -1,0 +1,61 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+*.dll
+
+# Virtual environment
+venv/
+.env/
+.venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# IDEs
+.vscode/
+.idea/
+*.code-workspace
+
+# OS-specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+
+# PyQt5 generated files (если UI-файлы компилируются вручную)
+*.ui.py
+*.qrc.py
+
+# Logs and runtime
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Matplotlib plots (если сохраняются)
+*.png
+*.svg
+
+# Capture files
+*.pcap
+*.pcapng
+traffic_*.bin
+dump_*.*
+
+# PyInstaller
+*.spec
+
+# Spyder
+.spyderproject
+.spyproject
