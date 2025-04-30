@@ -16,26 +16,10 @@ from pathlib import Path
 from typing import Iterator, Tuple
 import dpkt  # разбор пакетов / pcap
 import matplotlib.pyplot as plt
+import os
+import struct
+import fcntl
 import platform
-
-def get_active_iface_and_ip() -> tuple[str, str]:
-    """Определяет активный интерфейс и его IP (не loopback). Поддерживается только Linux."""
-    if platform.system().lower() != 'linux':
-        raise NotImplementedError("Автоматическое определение интерфейса поддерживается только под Linux.")
-    interfaces = os.listdir('/sys/class/net/')
-    for iface in interfaces:
-        if iface == 'lo':
-            continue
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            iface_bytes = struct.pack('256s', iface.encode('utf-8')[:15])
-            ip = socket.inet_ntoa(
-                fcntl.ioctl(sock.fileno(), 0x8915, iface_bytes)[20:24]
-            )
-            return iface, ip
-        except OSError:
-            continue
-    raise RuntimeError("Не найден активный интерфейс с IP.")
 
 # ————————————————————————————————————————————————————————————————
 #  Безопасный импорт pylibpcap
@@ -48,8 +32,6 @@ if _spec and _spec.origin and Path(_spec.origin).resolve() != Path(__file__).res
 # ————————————————————————————————————————————————————————————————
 #  Константы по умолчанию
 # ————————————————————————————————————————————————————————————————
-LOCAL_IP = "192.168.222.112"
-DEFAULT_IFACE = "eth0"
 DEFAULT_DURATION = 15
 PCAP_FILE_DEFAULT = Path("traffic.pcap")
 # ————————————————————————————————————————————————————————————————
@@ -60,6 +42,22 @@ def inet_to_str(inet: bytes) -> str:
 # ————————————————————————————————————————————————————————————————
 #  Класс статистики
 # ————————————————————————————————————————————————————————————————
+def get_iface_and_ip() -> tuple[str, str]:
+    """Определяет активный интерфейс и его IP-адрес (исключая loopback)."""
+    if platform.system().lower() != "linux":
+        raise NotImplementedError("Автоопределение IP работает только на Linux")
+    for iface in os.listdir("/sys/class/net/"):
+        if iface == "lo":
+            continue
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                ifreq = struct.pack("256s", iface.encode()[:15])
+                ip = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, ifreq)[20:24])
+                return iface, ip
+        except OSError:
+            continue
+    raise RuntimeError("Не найден активный интерфейс с IP")
+
 class CaptureStats:
     """Хранит данные и строит график."""
     def __init__(self) -> None:
@@ -120,8 +118,7 @@ class CaptureStats:
 # ————————————————————————————————————————————————————————————————
 #  Обработчик пакетов
 # ————————————————————————————————————————————————————————————————
-def handle_packet(ts: float, buf: bytes, mode: str, stats: CaptureStats, local_ip: str) -> None:
-
+def handle_packet(ts: float, buf: bytes, mode: str, stats: CaptureStats, LOCAL_IP: str) -> None:
     try:
         eth = dpkt.ethernet.Ethernet(buf)
     except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
@@ -166,37 +163,40 @@ def file_packets(path: Path) -> Iterator[Tuple[float, bytes]]:
 # ————————————————————————————————————————————————————————————————
 #  main()
 # ————————————————————————————————————————————————————————————————
-
 def main() -> None:
     print("===== TCP/UDP DATAGRAM ANALYZER (with plot) =====\n")
-
-    # Автоматическое определение интерфейса и IP
-    try:
-        iface, local_ip = get_active_iface_and_ip()
-        print(f"[ИНФО] Используем интерфейс: {iface}, IP: {local_ip}")
-    except Exception as e:
-        sys.exit(f"Ошибка при определении интерфейса/IP: {e}")
-
-    # Режим анализа — только исходящий
-    mode = "outgoing"
-
-    # Источник пакетов — только live
+    # режим
+    while True:
+        # mode = input("Режим (outgoing/incoming) [outgoing]: ").strip().lower() or "outgoing"
+        mode = "outgoing"
+        if mode in {"outgoing", "incoming"}:
+            break
+        print("Введите outgoing или incoming.")
+    # источник
+    # src_choice = input("Источник: 1-live | 2-pcap  [1]: ").strip() or "1"
     src_choice = "1"
     if src_choice == "1":
-        duration = 20  # захват 20 секунд
+        try:
+            # duration = int(input(f"Длительность, сек [{DEFAULT_DURATION}]: ") or DEFAULT_DURATION)
+            duration = 20
+        except ValueError:
+            duration = DEFAULT_DURATION
+        try:
+            iface, LOCAL_IP = get_iface_and_ip()
+            print(f"[ИНФО] Интерфейс: {iface}, IP: {LOCAL_IP}")
+        except Exception as e:
+            sys.exit(f"[ОШИБКА] {e}")
+
         packets = live_packets(iface, duration)
         print(f"\nЗахват {mode}-пакетов на {iface} (⏱ {duration} с)…\n")
     else:
-        pcap_path = Path("traffic.pcap")
+        pcap_path = Path(input(f"Файл pcap [{PCAP_FILE_DEFAULT}]: ").strip() or PCAP_FILE_DEFAULT)
         packets = file_packets(pcap_path)
         print(f"\nАнализ {mode}-пакетов из {pcap_path}…\n")
-
     stats = CaptureStats()
     for ts, buf in packets:
-        handle_packet(ts, buf, mode, stats, local_ip)
-
+        handle_packet(ts, buf, mode, stats, LOCAL_IP)
     stats.report(show_plot=True)
-
-
 if __name__ == "__main__":
     main()
+
