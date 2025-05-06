@@ -1,200 +1,166 @@
+#!/usr/bin/env python3
 """
-* Задание 14
-    1) Входящий трафик
-    2) Работаем с текущим трафиком, а не с предзаписанным файлом
-    3) Длительность захвата пакетов 20 секунд
-    4) Сетевой интерфейс для захвата eth0
-    5) ip адрес 192.168.222.112
+* Задание 13 – анализ исходящего трафика с самопроверкой
+  0-1 с  : пауза
+  1-2 с  : 100 TCP-OUT  (src = local_ip, dst = 192.0.2.1, dport=80)
+  2-3 с  : 100 TCP-IN   (не видим, т.к. фильтруем only OUT)
+  3-4 с  : 100 UDP-OUT  (src = local_ip, dst = 192.0.2.1, dport=80)
+  4-5 с  : 100 UDP-IN   (не видим)
+  5-25 с : пассивный захват
 """
+
 from __future__ import annotations
-import socket
-import sys
-import time
+import os, sys, time, socket, struct, fcntl, platform, random, threading
 from collections import defaultdict
 from importlib import util as import_util
-from pathlib import Path
 from typing import Iterator, Tuple
-import dpkt  # разбор пакетов / pcap
-import matplotlib.pyplot as plt
-import os
-import struct
-import fcntl
-import platform
-# ————————————————————————————————————————————————————————————————
-#  Безопасный импорт pylibpcap
-# ————————————————————————————————————————————————————————————————
-pylibpcap = None
-_spec = import_util.find_spec("pcap")
-if _spec and _spec.origin and Path(_spec.origin).resolve() != Path(__file__).resolve():
-    import importlib
-    pylibpcap = importlib.import_module("pcap")  # type: ignore
-# ————————————————————————————————————————————————————————————————
-#  Константы по умолчанию
-# ————————————————————————————————————————————————————————————————
-DEFAULT_DURATION = 20
-PCAP_FILE_DEFAULT = Path("traffic.pcap")
-# ————————————————————————————————————————————————————————————————
-#  Утилиты
-# ————————————————————————————————————————————————————————————————
-def inet_to_str(inet: bytes) -> str:
-    return socket.inet_ntoa(inet)
-# ————————————————————————————————————————————————————————————————
-#  Класс статистики
-# ————————————————————————————————————————————————————————————————
-class CaptureStats:
-    """Хранит данные и строит график."""
-    def __init__(self) -> None:
-        self.outgoing = defaultdict(int)
-        self.incoming = defaultdict(int)
-        self.records: list[tuple[float, str]] = []  # (timestamp, proto)
-        self.start_ts: float | None = None
-    def add(self, direction: str, proto: str, ts: float) -> None:
-        if self.start_ts is None:
-            self.start_ts = ts
-        (self.outgoing if direction == "out" else self.incoming)[proto] += 1
-        self.records.append((ts, proto))
-    # ——— итог + график ———
-    def report(self, show_plot: bool = True) -> None:
-        print("\n===== ИТОГОВАЯ СТАТИСТИКА =====")
-        print(f"Исходящие: {sum(self.outgoing.values()):>6}  {dict(self.outgoing)}")
-        print(f"Входящие : {sum(self.incoming.values()):>6}  {dict(self.incoming)}")
-        if len(self.records) < 2:
-            print("Недостаточно пакетов для анализа.")
-            return
-        # интервалы
-        ts_sorted = sorted(ts for ts, _ in self.records)
-        intervals = [b - a for a, b in zip(ts_sorted, ts_sorted[1:])]
-        print("\nИнтервалы между соседними пакетами:")
-        print(f"   средний : {sum(intervals)/len(intervals):.6f} с")
-        print(f"   максимум: {max(intervals):.6f} с")
-        print(f"   минимум : {min(intervals):.6f} с")
-        # агрегируем по секундам и протоколам
-        base = int(self.start_ts) if self.start_ts else 0
-        per_sec_tcp: dict[int, int] = defaultdict(int)
-        per_sec_udp: dict[int, int] = defaultdict(int)
-        for ts, proto in self.records:
-            sec = int(ts) - base
-            if proto == "TCP":
-                per_sec_tcp[sec] += 1
-            else:
-                per_sec_udp[sec] += 1
-        # вывод распределения (текст)
-        print("\nРаспределение по секундам (offset → TCP/UDP):")
-        all_secs = sorted(set(per_sec_tcp) | set(per_sec_udp))
-        for s in all_secs:
-            print(f"  +{s:>2} с: {per_sec_tcp.get(s, 0):>4} TCP | {per_sec_udp.get(s, 0):>4} UDP")
+import dpkt, matplotlib.pyplot as plt
+
+# ─────── Параметры ──────────────────────────────────────────────────────────
+PAUSE_SEC     = 1
+BURST_SEC     = 4
+POST_SEC      = 20
+TOTAL_SEC     = PAUSE_SEC + BURST_SEC + POST_SEC     # 25 с
+
+BURST_PKTS    = 100       # ← Сколько тест-пакетов генерировать в фазе
+SEND_DELAY    = 0.006     # Задержка между кадрами, чтобы не терялись
+
+TEST_REMOTE_IP = "192.0.2.1"
+TCP_PROTO, UDP_PROTO = 6, 17          # номера протоколов в IP-заголовке
+
+# ─────── Генерация контрольного трафика ─────────────────────────────────────
+def _csum(b: bytes) -> int:
+    if len(b) & 1: b += b"\0"
+    s = sum(struct.unpack("!%dH" % (len(b)//2), b))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return (~s) & 0xFFFF
+
+def _ip_hdr(src: str, dst: str, proto: int, pay_len: int) -> bytes:
+    base = struct.pack("!BBHHHBBH4s4s",
+        0x45, 0, 20+pay_len, random.randint(0,65535), 0,
+        64, proto, 0, socket.inet_aton(src), socket.inet_aton(dst))
+    return base[:10] + struct.pack("!H", _csum(base)) + base[12:]
+
+def _tcp_seg(sport:int, dport:int)->bytes:
+    return struct.pack("!HHLLBBHHH",
+        sport, dport, random.randint(0,0xFFFFFFFF), 0,
+        5<<4, 0x02, 65535, 0, 0)               # SYN, пустая сумма
+
+def _udp_seg(sport:int, dport:int)->bytes:
+    return struct.pack("!HHHHB", sport, dport, 9, 0, 0x58)  # 1 байт payload
+
+def _pkt(src:str, dst:str, proto:str, sport:int, dport:int)->bytes:
+    seg  = _tcp_seg(sport,dport) if proto=="TCP" else _udp_seg(sport,dport)
+    pnum = TCP_PROTO if proto=="TCP" else UDP_PROTO
+    return _ip_hdr(src,dst,pnum,len(seg))+seg
+
+def _burst(proto:str, direction:str, local_ip:str):
+    dport=80
+    sport0=random.randint(20000,60000)
+    pkts=[ _pkt(local_ip,TEST_REMOTE_IP,proto,sport0+i,dport)
+           if direction=="out"
+           else _pkt(TEST_REMOTE_IP,local_ip,proto,sport0+i,dport)
+           for i in range(BURST_PKTS)]
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as s:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        dst = TEST_REMOTE_IP if direction=="out" else local_ip
+        for p in pkts:
+            s.sendto(p,(dst,0)); time.sleep(SEND_DELAY)
+
+def launch_burst_thread(local_ip:str):
+    phases=[("TCP","out"),("TCP","in"),("UDP","out"),("UDP","in")]
+    def runner():
+        time.sleep(PAUSE_SEC)
+        for proto,dir_ in phases:
+            t0=time.time(); _burst(proto,dir_,local_ip)
+            time.sleep(max(0,1-(time.time()-t0)))
+    threading.Thread(target=runner,daemon=True).start()
+
+# ─────── Сетевые утилиты ────────────────────────────────────────────────────
+def inet(b:bytes)->str: return socket.inet_ntoa(b)
+
+def get_iface_ip()->tuple[str,str]:
+    if platform.system().lower()!="linux": sys.exit("Требуется Linux.")
+    for iface in os.listdir("/sys/class/net"):
+        if iface=="lo": continue
+        try:
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as s:
+                ifreq=struct.pack("256s",iface.encode()[:15])
+                ip=socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,ifreq)[20:24])
+                return iface,ip
+        except OSError: pass
+    sys.exit("Нет интерфейса с IPv4.")
+
+# ─────── Захват через pylibpcap ─────────────────────────────────────────────
+pylibpcap=None
+if (sp := import_util.find_spec("pcap")) and sp.origin:
+    import importlib; pylibpcap=importlib.import_module("pcap")      # type: ignore
+
+def sniff(iface:str, secs:int)->Iterator[Tuple[float,bytes]]:
+    if not pylibpcap: sys.exit("Установите pylibpcap + sudo.")
+    pc=pylibpcap.pcap(name=iface,promisc=True,immediate=True,timeout_ms=0)
+    end=time.time()+secs
+    try:                                 # новый API
+        while time.time()<end:
+            try: ts,raw=pc.recv(timeout_ms=100)
+            except (BlockingIOError,OSError): continue
+            if ts: yield ts,raw
+    except AttributeError:               # старый API – итератор
+        for ts,raw in pc:
+            if time.time()>=end: break
+            yield ts,raw
+
+# ─────── Счётчик и репортер ────────────────────────────────────────────────
+class Stat:
+    def __init__(self): self.t0=None; self.tcp=[]; self.udp=[]
+    def _ensure(self,sec:int):
+        while len(self.tcp)<=sec: self.tcp.append(0); self.udp.append(0)
+    def add(self,proto:str,ts:float):
+        if self.t0 is None: self.t0=ts
+        sec=int(ts-self.t0)+1
+        self._ensure(sec)
+        (self.tcp if proto=="TCP" else self.udp)[sec]+=1
+    def report(self):
+        print("\n===== ИТОГ =====")
+        exp_tcp=BURST_PKTS   # ожидаем TCP-OUT на +2 с
+        exp_udp=BURST_PKTS   #         UDP-OUT на +4 с
+        got_tcp=self.tcp[2] if len(self.tcp)>2 else 0
+        got_udp=self.udp[4] if len(self.udp)>4 else 0
+        print(f"Ожидалось / поймано TCP @+2 с : {exp_tcp} / {got_tcp}")
+        print(f"Ожидалось / поймано UDP @+4 с : {exp_udp} / {got_udp}\n")
+        max_sec=len(self.tcp)-1
+        print("Распределение по секундам (+offset → TCP | UDP):")
+        for s in range(max_sec+1):
+            t=self.tcp[s] if s<len(self.tcp) else 0
+            u=self.udp[s] if s<len(self.udp) else 0
+            print(f" +{s:>2} с: {t:4} TCP | {u:4} UDP")
         # график
-        if show_plot:
-            secs = all_secs
-            tcp_counts = [per_sec_tcp.get(s, 0) for s in secs]
-            udp_counts = [per_sec_udp.get(s, 0) for s in secs]
-            plt.figure(figsize=(10, 4))
-            plt.plot(secs, tcp_counts, label="TCP", marker="o", linewidth=1.5, color="tab:green")
-            plt.plot(secs, udp_counts, label="UDP", marker="o", linewidth=1.5, color="tab:red")
-            plt.title(f"Временное распределение входящих IPv4 дейтаграмм с разделением пакетов по \nпротоколам TCP и UDP транспортного уровня модели OSI")
-            plt.xlabel("Секунды")
-            plt.ylabel("Пакеты")
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-            plt.tight_layout()
-            plt.show()
-# ————————————————————————————————————————————————————————————————
-#  Обработчик пакетов
-# ————————————————————————————————————————————————————————————————
-def handle_packet(ts: float, buf: bytes, mode: str, stats: CaptureStats, LOCAL_IP: str) -> None:
-    try:
-        eth = dpkt.ethernet.Ethernet(buf)
-    except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
-        return
-    if not isinstance(eth.data, dpkt.ip.IP):
-        return
-    ip = eth.data
-    proto = (
-        "TCP" if isinstance(ip.data, dpkt.tcp.TCP) else
-        "UDP" if isinstance(ip.data, dpkt.udp.UDP) else None
-    )
-    if proto is None:
-        return
-    src, dst = inet_to_str(ip.src), inet_to_str(ip.dst)
-    if mode == "outgoing" and src == LOCAL_IP:
-        stats.add("out", proto, ts)
-        direction = "OUT"
-    elif mode == "incoming" and dst == LOCAL_IP:
-        stats.add("in", proto, ts)
-        direction = "IN "
-    else:
-        return
-    print(f"[{time.strftime('%H:%M:%S', time.localtime(ts))}] {direction} {src} -> {dst}")
-# ————————————————————————————————————————————————————————————————
-#  Источники пакетов
-# ————————————————————————————————————————————————————————————————
-def live_packets(iface: str, duration: int) -> Iterator[Tuple[float, bytes]]:
-    if pylibpcap is None:
-        sys.exit("Установите ‘pylibpcap’ и запустите с sudo для live-захвата.")
-    pc = pylibpcap.pcap(name=iface, promisc=True, immediate=True, timeout_ms=50)
-    stop_at = time.time() + duration
-    for ts, raw in pc:
-        if ts >= stop_at:
-            break
-        yield ts, raw
-def file_packets(path: Path) -> Iterator[Tuple[float, bytes]]:
-    if not path.exists():
-        sys.exit(f"Файл {path} не найден.")
-    with path.open("rb") as f:
-        for ts, buf in dpkt.pcap.Reader(f):
-            yield ts, buf
+        plt.figure(figsize=(10,4))
+        plt.plot(range(len(self.tcp)), self.tcp, label="TCP", marker="o")
+        plt.plot(range(len(self.udp)), self.udp, label="UDP", marker="o")
+        plt.title("Временное распределение исходящих IPv4-дейтаграмм")
+        plt.xlabel("Секунды"); plt.ylabel("Пакеты")
+        plt.grid(alpha=.3); plt.legend(); plt.tight_layout(); plt.show()
 
-def get_active_iface_and_ip() -> tuple[str, str]:
-    """Определяет активный интерфейс и IP-адрес (только Linux)."""
-    if platform.system().lower() != "linux":
-        raise NotImplementedError("Только для Linux.")
-    for iface in os.listdir("/sys/class/net/"):
-        if iface == "lo":
-            continue
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                iface_bytes = struct.pack("256s", iface.encode('utf-8')[:15])
-                ip = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, iface_bytes)[20:24])
-                return iface, ip
-        except OSError:
-            continue
-    raise RuntimeError("Не найден интерфейс с IP.")
+# ─────── main ──────────────────────────────────────────────────────────────
+def main():
+    iface,ip=get_iface_ip()
+    print(f"[INFO] iface={iface}, ip={ip}")
+    launch_burst_thread(ip)
+    st=Stat()
+    for ts,buf in sniff(iface,TOTAL_SEC):
+        eth=dpkt.ethernet.Ethernet(buf)
+        if not isinstance(eth.data,dpkt.ip.IP): continue
+        ip4=eth.data
+        if inet(ip4.dst)!=ip: continue
+        prot="TCP" if isinstance(ip4.data,dpkt.tcp.TCP) else \
+             "UDP" if isinstance(ip4.data,dpkt.udp.UDP) else None
+        if not prot: continue
+        print(f"{time.strftime('%H:%M:%S',time.localtime(ts))}  "
+              f"{inet(ip4.src)} → {inet(ip4.dst)}  {prot}")
+        st.add(prot,ts)
+    st.report()
 
-# ————————————————————————————————————————————————————————————————
-#  main()
-# ————————————————————————————————————————————————————————————————
-def main() -> None:
-    print("===== TCP/UDP DATAGRAM ANALYZER (with plot) =====\n")
-    # режим
-    while True:
-        # mode = input("Режим (outgoing/incoming) [outgoing]: ").strip().lower() or "outgoing"
-        mode = "incoming"
-        if mode in {"outgoing", "incoming"}:
-            break
-        print("Введите outgoing или incoming.")
-    # источник
-    # src_choice = input("Источник: 1-live | 2-pcap  [1]: ").strip() or "1"
-    src_choice = "1"
-    if src_choice == "1":
-        try:
-            # duration = int(input(f"Длительность, сек [{DEFAULT_DURATION}]: ") or DEFAULT_DURATION)
-            duration = DEFAULT_DURATION
-        except ValueError:
-            duration = DEFAULT_DURATION
-        try:
-            iface, LOCAL_IP = get_active_iface_and_ip()
-            print(f"[ИНФО] Интерфейс: {iface}, IP: {LOCAL_IP}")
-        except Exception as e:
-            sys.exit(f"Ошибка при определении интерфейса/IP: {e}")
-        packets = live_packets(iface, duration)
-        print(f"\nЗахват {mode}-пакетов на {iface} (⏱ {duration} с)…\n")
-    else:
-        pcap_path = Path(input(f"Файл pcap [{PCAP_FILE_DEFAULT}]: ").strip() or PCAP_FILE_DEFAULT)
-        packets = file_packets(pcap_path)
-        print(f"\nАнализ {mode}-пакетов из {pcap_path}…\n")
-    stats = CaptureStats()
-    for ts, buf in packets:
-        handle_packet(ts, buf, mode, stats, LOCAL_IP)
-    stats.report(show_plot=True)
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
